@@ -8,125 +8,124 @@ from flask_socketio import SocketIO, emit
 from mss import mss
 from PIL import Image
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import cv2
+import zlib
+from queue import Queue, Empty
+import lz4.frame
 from pynput.mouse import Controller as MouseController, Button
 from pynput.keyboard import Controller as KeyboardController, Key, KeyCode
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-class ChunkedImageProcessor:
-    def __init__(self, chunk_size=128):
-        self.chunk_size = chunk_size
+class OptimizedStreamProcessor:
+    def __init__(self):
         self.last_frame = None
-        self.reference_frame = None
-        self.black_threshold = 30  # Threshold for considering an image "black"
-        self.last_dimensions = None
+        self.last_hash = None
+        self.motion_threshold = 0.015  # Lower threshold for more sensitive detection
+        self.keyframe_interval = 30    # Force keyframe every 30 frames
+        self.frame_count = 0
+        self.compression_queue = Queue(maxsize=2)  # Limit queue size
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        self.frame_buffer = {}  # Client-specific frame buffer
+        self.client_stats = {}  # Track client performance
         
-    def is_black_frame(self, img):
-        """Check if image is predominantly black"""
-        np_img = np.array(img)
-        return np.mean(np_img) < self.black_threshold
-    
-    def get_frame_difference(self, current, previous):
-        """Calculate difference between frames"""
-        if previous is None:
+    def compress_frame(self, img, quality=95, is_keyframe=False):
+        """Optimized frame compression with LZ4"""
+        try:
+            # Convert to BGR for cv2
+            frame_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            
+            if not is_keyframe:
+                # Reduce color depth for non-keyframes
+                frame_bgr = (frame_bgr // 32) * 32
+                
+            # Apply dynamic compression based on frame type
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 
+                          quality if is_keyframe else min(quality, 80)]
+            
+            # Compress frame
+            _, buffer = cv2.imencode('.jpg', frame_bgr, encode_param)
+            
+            # Additional LZ4 compression for network transfer
+            compressed = lz4.frame.compress(buffer.tobytes(), 
+                                         compression_level=3 if is_keyframe else 1)
+            
+            return compressed
+            
+        except Exception as e:
+            print(f"Compression error: {e}")
+            return None
+
+    def calculate_frame_diff(self, current_frame):
+        """Fast frame difference calculation"""
+        if self.last_frame is None:
             return 1.0
             
-        # Check if dimensions match
-        if current.size != previous.size:
-            return 1.0  # Force full frame update when dimensions change
+        try:
+            # Calculate hash-based difference
+            current_hash = cv2.img_hash.averageHash(
+                cv2.cvtColor(np.array(current_frame), cv2.COLOR_RGB2BGR)
+            )[0]
+            
+            if self.last_hash is not None:
+                diff = cv2.norm(current_hash, self.last_hash, cv2.NORM_L1)
+                self.last_hash = current_hash
+                return diff / 64.0  # Normalize
+            
+            self.last_hash = current_hash
+            return 1.0
+            
+        except Exception:
+            return 1.0
+
+    def process_frame(self, img, client_id, quality=95):
+        """Process frame with adaptive compression"""
+        self.frame_count += 1
+        is_keyframe = (self.frame_count % self.keyframe_interval == 0)
+        
+        # Skip frame if queue is full (client too slow)
+        if self.compression_queue.full():
+            return None
             
         try:
-            current_np = np.array(current)
-            previous_np = np.array(previous)
-            diff = np.mean(np.abs(current_np - previous_np))
-            return diff / 255.0
-        except ValueError:
-            return 1.0  # Return max difference if comparison fails
-    
-    def split_into_chunks(self, img):
-        """Split image into chunks"""
-        width, height = img.size
-        chunks = []
-        for y in range(0, height, self.chunk_size):
-            for x in range(0, width, self.chunk_size):
-                chunk = img.crop((x, y, min(x + self.chunk_size, width), 
-                                min(y + self.chunk_size, height)))
-                chunks.append({
-                    'position': (x, y),
-                    'data': chunk
-                })
-        return chunks
-    
-    def process_frame(self, img, quality=85, scale=1.0):
-        """Process frame and determine what needs to be sent"""
-        # Scale image if needed
-        if scale != 1.0:
-            new_width = int(img.size[0] * scale)
-            new_height = int(img.size[1] * scale)
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        current_dimensions = img.size
-        
-        # Force full frame update if dimensions changed
-        force_full_update = (self.last_dimensions != current_dimensions)
-        
-        result = {
-            'type': 'partial',
-            'chunks': [],
-            'width': img.size[0],
-            'height': img.size[1]
+            frame_diff = self.calculate_frame_diff(img)
+            client_stats = self.client_stats.get(client_id, {'lag': 0})
+            
+            # Adapt quality based on client performance
+            if client_stats['lag'] > 100:  # Client is lagging
+                quality = min(quality, 70)
+                if client_stats['lag'] > 200:
+                    return None  # Skip frame entirely
+                    
+            # Process frame if enough change or keyframe
+            if frame_diff > self.motion_threshold or is_keyframe:
+                compressed = self.compress_frame(img, quality, is_keyframe)
+                
+                if compressed:
+                    result = {
+                        'type': 'keyframe' if is_keyframe else 'delta',
+                        'data': base64.b64encode(compressed).decode('utf-8'),
+                        'timestamp': time.time()
+                    }
+                    return result
+                    
+            return None
+            
+        except Exception as e:
+            print(f"Frame processing error: {e}")
+            return None
+
+    def update_client_stats(self, client_id, request_time, receive_time):
+        """Track client performance"""
+        lag = (receive_time - request_time) * 1000  # Convert to ms
+        self.client_stats[client_id] = {
+            'lag': lag,
+            'last_update': time.time()
         }
         
-        # Check if it's a black frame or if we need a force update
-        if self.is_black_frame(img) or force_full_update:
-            result['type'] = 'full'
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=quality)
-            result['data'] = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            self.reference_frame = img
-            self.last_frame = img
-            self.last_dimensions = current_dimensions
-            return result
-        
-        # If no reference frame exists or significant change detected
-        if (self.reference_frame is None or 
-            self.get_frame_difference(img, self.reference_frame) > 0.3):
-            result['type'] = 'full'
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=quality)
-            result['data'] = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            self.reference_frame = img
-            self.last_frame = img
-            self.last_dimensions = current_dimensions
-            return result
-        
-        # Process chunks for partial updates
-        try:
-            if self.last_frame is not None:
-                current_chunks = self.split_into_chunks(img)
-                previous_chunks = self.split_into_chunks(self.last_frame)
-                
-                for curr, prev in zip(current_chunks, previous_chunks):
-                    if self.get_frame_difference(curr['data'], prev['data']) > 0.1:
-                        buffer = io.BytesIO()
-                        curr['data'].save(buffer, format="JPEG", quality=quality)
-                        result['chunks'].append({
-                            'position': curr['position'],
-                            'data': base64.b64encode(buffer.getvalue()).decode('utf-8')
-                        })
-        except Exception as e:
-            # If chunk processing fails, fall back to full frame
-            result['type'] = 'full'
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=quality)
-            result['data'] = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        
-        self.last_frame = img
-        self.last_dimensions = current_dimensions
-        return result
-        
-image_processor = ChunkedImageProcessor(chunk_size=128)
+stream_processor = OptimizedStreamProcessor()
 
 
 # Controllers
@@ -157,77 +156,59 @@ def index():
 
 
 
+
 def capture_screen():
-    global current_frame, screen_width, screen_height
-    
+    frame_interval = 1.0 / 30  # Target 30 FPS
     with mss() as sct:
         monitor = sct.monitors[1]
-        screen_width, screen_height = monitor["width"], monitor["height"]
-        print(f"Detected screen resolution: {screen_width}x{screen_height}")
         
         while True:
-            start_time = time.time()
-            
             try:
-                # Capture screen and convert to RGB
-                sct_img = sct.grab(monitor)
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                loop_start = time.time()
                 
-                # Store the original image in memory
-                with frame_lock:
-                    buffer = io.BytesIO()
-                    img.save(buffer, format="JPEG", quality=95)  # High quality base image
-                    current_frame = {
-                        'buffer': buffer.getvalue(),
-                        'width': screen_width,
-                        'height': screen_height,
-                        'timestamp': time.time()
-                    }
+                # Capture screen
+                frame = sct.grab(monitor)
+                img = Image.frombytes("RGB", frame.size, frame.bgra, "raw", "BGRX")
                 
-                # Broadcast frame availability to all clients
-                socketio.emit('frame_ready', {
-                    'timestamp': current_frame['timestamp'],
-                    'width': screen_width,
-                    'height': screen_height
-                })
+                # Process frame synchronously to avoid timing issues
+                result = stream_processor.process_frame(img, 'broadcast')
                 
-                time.sleep(max(0, 1 / frame_rate - (time.time() - start_time)))
+                # Emit frame if valid
+                if result:
+                    socketio.emit('screen_update', result)
                 
+                # Calculate and maintain frame rate
+                processing_time = time.time() - loop_start
+                remaining_time = frame_interval - processing_time
+                
+                if remaining_time > 0:
+                    time.sleep(remaining_time)
+                    
             except Exception as e:
-                print(f"Screen capture error: {e}")
-                time.sleep(1)
+                print(f"Capture error: {e}")
+                time.sleep(0.1)
 
+
+                
 @socketio.on('request_frame')
-def handle_frame_request(data):
-    """Handle client frame requests with chunk-based updates"""
+def handle_frame_request(data, sid=None):
+    client_id = sid
+    request_time = data.get('timestamp', time.time())
+    
     try:
-        requested_quality = int(data.get('quality', 85))
-        requested_scale = float(data.get('scale', 1.0))
-        client_timestamp = data.get('timestamp', 0)
+        # Update client stats
+        stream_processor.update_client_stats(
+            client_id, 
+            request_time, 
+            time.time()
+        )
         
-        with frame_lock:
-            if not current_frame or client_timestamp >= current_frame['timestamp']:
-                return
-            
-            # Load the original frame
-            img = Image.open(io.BytesIO(current_frame['buffer']))
-            
-            # Process frame with chunking system
-            result = image_processor.process_frame(
-                img, 
-                quality=requested_quality,
-                scale=requested_scale
-            )
-            
-            # Add timestamp to result
-            result['timestamp'] = current_frame['timestamp']
-            
-            # Send frame update to client
-            emit('screen_update', result)
-            
+        # Frame will be sent via broadcast from capture thread
+        
     except Exception as e:
         print(f"Frame request error: {e}")
 
+        
 def get_key_from_code(key_code):
     """Convert web key codes to pynput keys with improved handling for regular typing"""
     # Special keys mapping
